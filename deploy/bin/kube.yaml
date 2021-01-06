@@ -1,0 +1,128 @@
+programs:
+
+  # Count EADDRINUSE errors, that can be triggered by either error
+  # or by running out of free sockets on the machine.
+
+  - name: tcpconnectlatency
+    metrics:
+      histograms:
+        - name: tcp_connect_latency_seconds
+          help: Tcp connect latency histogram
+          table: tcp_connect_latency
+          bucket_type: exp2
+          bucket_min: 0
+          bucket_max: 26
+          bucket_multiplier: 0.000001 # microseconds to seconds
+          labels:
+            - name: app_namespace
+              size: 8
+              reuse: true
+              decoders:
+                - name: kube_podnamespace
+            - name: app_container
+              size: 8
+              reuse: false
+              decoders:
+                - name: kube_containername
+            - name: subnet
+              size: 8
+              reuse: false
+              decoders:
+                - name: uint
+            - name: bucket
+              size: 8
+              reuse: false
+              decoders:
+                - name: uint
+    kprobes:
+      tcp_v4_connect: trace_connect
+      tcp_v6_connect: trace_connect
+      tcp_rcv_state_process: trace_tcp_rcv_state_process
+    code: |
+      #include <uapi/linux/ptrace.h>
+      #include <net/sock.h>
+      #include <net/tcp_states.h>
+      #include <bcc/proto.h>
+
+      typedef struct pid_key {
+          u64 pid;
+          u64 subnet;
+          u64 slot;
+      } pid_key_t;
+
+      // Max number of subnets
+      const u8 max_subnets = 255;
+
+
+      // 27 buckets for latency, max range is 33.6s .. 67.1s
+      const u8 max_latency_slot = 26;
+
+      // Histograms to record latencies
+      BPF_HISTOGRAM(tcp_connect_latency, pid_key_t, (max_latency_slot + 2) * max_subnets);
+
+      BPF_HASH(start, struct sock *, u64);
+
+      int trace_connect(struct pt_regs *ctx, struct sock *sk) {
+          u64 ts = bpf_ktime_get_ns();
+          start.update(&sk, &ts);
+          return 0;
+      }
+
+      // Calculate latency
+      int trace_tcp_rcv_state_process(struct pt_regs *ctx, struct sock *skp) {
+          // will be in TCP_SYN_SENT for handshake
+          if (skp->__sk_common.skc_state != TCP_SYN_SENT)
+            return 0;
+
+          // check start and calculate delta
+          u64 *tsp = start.lookup(&skp);
+          if (tsp == 0) {
+              return 0;   // missed entry or filtered
+          }
+
+          // Latency in microseconds
+          u64 latency_us = bpf_ktime_get_ns() - *tsp;
+          // Skip entries with backwards time: temp workaround for https://github.com/iovisor/bcc/issues/728
+          if ((s64) latency_us < 0) {
+            start.delete(&skp);
+            return 0;
+          }
+          // Convert to microseconds
+          latency_us /= 1000;
+
+          // Latency histogram key
+          u64 latency_slot = bpf_log2l(latency_us);
+
+          // Cap latency bucket at max value
+          if (latency_slot > max_latency_slot) {
+              latency_slot = max_latency_slot;
+          }
+
+          u64 id = bpf_get_current_pid_tgid();
+          u64 pid = id >> 32; // PID is higher part
+          pid_key_t latency_key = { .pid = pid, .slot = latency_slot };
+          u32 addr = 0;
+          u16 family = 0;
+          family = skp->__sk_common.skc_family;
+          if (family == AF_INET) {
+            addr = skp->__sk_common.skc_daddr;
+            addr = ntohl(addr) >> 24;
+            if(addr != 10 && addr != 127 && addr != 172 && addr != 192) {
+              addr = 0;
+            }
+          }
+          latency_key.subnet = addr;
+
+          // Increment bucket key
+          tcp_connect_latency.increment(latency_key);
+
+          // Increment sum key
+          latency_key.slot = max_latency_slot + 1;
+          tcp_connect_latency.increment(latency_key, latency_us);
+
+          // Remove enqueued task
+          start.delete(&skp);
+
+          return 0;
+      }
+
