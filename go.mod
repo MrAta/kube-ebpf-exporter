@@ -14,7 +14,7 @@ require (
 	github.com/gogo/protobuf v1.3.1 // indirect
 	github.com/google/go-cmp v0.4.0 // indirect
 	github.com/gorilla/mux v1.7.4 // indirect
-	github.com/iovisor/gobpf v0.0.0-20190101180936-b0976764b280
+	github.com/iovisor/gobpf v0.0.0-20200614202714-e6b321d32103
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0-rc1 // indirect
